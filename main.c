@@ -5,14 +5,16 @@
 #include <sys/types.h>
 #include <openssl/sha.h>
 #include <tss2/tss2_esys.h>
+#include <tss2/tss2_fapi.h>
 
 #define IMA_FILE "/sys/kernel/security/ima/ascii_runtime_measurements"
 
 long long getIMAFileSize();
 int getIMAFileContents(char *buffer);
-unsigned char *getSelfHash(char *argv[]);
+void getSelfHash(char *argv[], char outputBuffer[65]);
 void SHA256HashToString(unsigned char hash[SHA256_DIGEST_LENGTH], char outputBuffer[65]);
 int bytesToHex(uint8_t *buffer, uint size, char *out);
+int compareHashes(const void *a, const void *b);
 char *sortedMeasurements(FILE *file);
 
 int main(int argc, char *argv[])
@@ -21,9 +23,12 @@ int main(int argc, char *argv[])
     seteuid(geteuid());
 
     char *imaFileContents = NULL;
+    char *imaFileContentsCopy = NULL;
     long long fileSize = getIMAFileSize();
     imaFileContents = calloc(1, sizeof(char) * fileSize);
+    imaFileContentsCopy = calloc(1, sizeof(char) * fileSize);
     getIMAFileContents(imaFileContents);
+    strncpy(imaFileContentsCopy, imaFileContents, fileSize);
     // printf("%s", imaFileContents);
 
     printf("IMA File Size = %lli\n", fileSize);
@@ -33,22 +38,68 @@ int main(int argc, char *argv[])
     SHA256(imaFileContents, fileSize, hash);
     SHA256HashToString(hash, buf);
 
+    unsigned char selfHash[65];
+    getSelfHash(argv, selfHash);
+
     int pcr;                  // PCR that IMA stores to
     char template_hash[41];   // template-hash: sha1 hash(filedata-hash length, filedata-hash, pathname length, pathname)
     char template[41];        // template: ima templates
     char filedata_hash[72];   // algorithm:hash
     char filename_hint[4096]; // filepath and name
 
+    int length = 0;
+    int current = 0;
+
+    // PCR     template-hash                     template filedata-hash                                                           filename-hint
     // 10 a299b10283deb996899cea45cdb557cc570b442b ima-ng sha256:4a8d913f1cb21825816e398c55ee043a3ed6f19c5233c8a3dd6663fbc7c28961 boot_aggregate
-    for (char *p = strtok(imaFileContents, "\n"); p != NULL; p = strtok(NULL, "\n"))
+    for (char *p = strtok(imaFileContentsCopy, "\n"); p != NULL; p = strtok(NULL, "\n"))
     {
         sscanf(p, "%d %s %s %s %s", &pcr, template_hash, template, filedata_hash, filename_hint);
-        // printf("%d %s %s %s %s\n", pcr, template_hash, template, filedata_hash, filename_hint);
-        // puts(p);
-        break;
+        if(strncmp(filedata_hash, "sha256:", 7) == 0)
+        {
+            printf("%s\n", filedata_hash);
+            length += 1;
+        }
     }
+
+    char **hashes;
+    hashes = calloc(length - 1, sizeof(char *));
+    for (char *p = strtok(imaFileContents, "\n"); p != NULL; p = strtok(NULL, "\n"))
+    {
+        char hashOnly[65];
+        sscanf(p, "%d %s %s %s %s", &pcr, template_hash, template, filedata_hash, filename_hint);
+        strncpy(hashOnly, filedata_hash + 7, 65);
+        if (!strncmp(hashOnly, selfHash, 65))
+        {
+            printf("Excluded hash %s which is this program\n", selfHash);
+        }
+        else if(strncmp(filedata_hash, "sha256:", 7) == 0)
+        {
+            hashes[current] = calloc(1, sizeof(char) * 65);
+            strncpy(hashes[current], hashOnly, 65);
+            current += 1;
+        }
+        // printf("%d %s %s %s %s\n", pcr, template_hash, template, filedata_hash, filename_hint);
+        // printf("hash only = %s\n", hashOnly);
+    }
+
+    for (int i = 0; i < length - 1; ++i)
+    {
+        printf("hash[%d]=%s\n", i, hashes[i]);
+    }
+
+    printf("length = %d\n", length);
+
+    qsort(hashes, length - 1, sizeof(*hashes), compareHashes);
+
+    for (int i = 0; i < length - 1; ++i)
+    {
+        printf("hash[%d]=%s\n", i, hashes[i]);
+    }
+
+    printf("length = %d\n", length);
+
     printf("hash = %s\n", buf);
-    getSelfHash(argv);
 
     TSS2_RC result;
 
@@ -148,9 +199,10 @@ int getIMAFileContents(char *buffer)
     fclose(fptr);
 }
 
-unsigned char *getSelfHash(char *argv[])
+void getSelfHash(char *argv[], char outputBuffer[65])
 {
     FILE *fptr = NULL;
+    unsigned char hash[65];
     if ((fptr = fopen(argv[0], "rb")) == NULL)
     {
         printf("[-] An error ocurred. Please run this program with the full path.\n");
@@ -158,15 +210,13 @@ unsigned char *getSelfHash(char *argv[])
     else
     {
         fseek(fptr, 0L, SEEK_END);
-        int sz = ftell(fptr);
+        int size = ftell(fptr);
         fseek(fptr, 0L, SEEK_SET);
-        unsigned char *contents = malloc(sz);
-        fread(contents, sz, 1, fptr);
-        unsigned char hash[65];
-        unsigned char buf[65];
-        SHA256(contents, sz, hash);
-        SHA256HashToString(hash, buf);
-        printf("self hash = %s\n", buf);
+        unsigned char *contents = malloc(size);
+        fread(contents, size, 1, fptr);
+        SHA256(contents, size, hash);
+        SHA256HashToString(hash, outputBuffer);
+        printf("self hash = %s\n", outputBuffer);
         free(contents);
     }
     fclose(fptr);
@@ -193,4 +243,11 @@ int bytesToHex(uint8_t *buffer, uint size, char *out)
         bytesWritten += snprintf(out, 3, "%02x", buffer[i]);
     }
     return bytesWritten;
+}
+
+int compareHashes(const void *a, const void *b)
+{
+    const char *arg1 = *(const char **)a;
+    const char *arg2 = *(const char **)b;
+    return strncmp(arg1, arg2, 65);
 }
